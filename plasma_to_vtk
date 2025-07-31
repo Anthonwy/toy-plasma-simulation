@@ -1,0 +1,129 @@
+from vpython import *
+import random
+import os
+
+# ─────────── Scene & Constants ───────────
+scene = canvas(title='3D Plasma Simulation: 500 e⁻ + 500 ions + Al Plate w/ Collisions',
+               width=1200, height=800, center=vector(0,0,0), background=vector(0,0,0))
+
+k_e    = 8.9875517923e9     # Coulomb’s constant
+e      = 1.602176634e-19    # elementary charge
+m_e    = 9.1093837015e-31   # electron mass
+m_ion  = 1.67262192e-27     # proton mass
+
+dt             = 1e-25      # time step
+position_scale = 1e16       # visualization scale
+impact_speed   = 1e7        # initial speed towards plate (m/s)
+N              = 500        # particles per species
+
+# Simulation control
+total_steps       = 2000    # run exactly 2000 iterations
+output_frequency  = 1       # dump every step -> 2000 CSVs
+
+# ◀◀◀ setup export directory
+output_dir = "pv_output"
+os.makedirs(output_dir, exist_ok=True)
+
+# Summary file logs step & total collision work
+def init_summary():
+    summary_path = os.path.join(output_dir, 'summary.csv')
+    f = open(summary_path, 'w')
+    f.write('step,work_per_collision\n')
+    return f
+
+summary_file = init_summary()
+
+# ─────────── Plate as rigid wall ───────────
+plate_thickness = 5e-15
+plate_size_xy   = 5e-13
+plate_z_m       = -20.0/position_scale
+plate = box(pos=vector(0,0,plate_z_m - plate_thickness/2)*position_scale,
+            size=vector(plate_size_xy,plate_size_xy,plate_thickness)*position_scale,
+            color=vector(0.7,0.7,0.7), opacity=0.6)
+n_plate = vector(0,0,1)
+
+e_r = 0.8                    # restitution
+a_work = 0.                 # accumulated work
+
+# ─────────── Particle class ───────────
+class Particle:
+    def __init__(self, sph, pos, vel, m, q, kind):
+        self.sphere   = sph
+        self.position = pos
+        self.velocity = vel
+        self.mass     = m
+        self.charge   = q
+        self.kind     = kind
+        self.radius   = 2.8e-15 if kind=='electron' else 1e-15
+        self.force    = vector(0,0,0)
+    def update_sphere_position(self):
+        self.sphere.pos = self.position * position_scale
+    def collide_with_plate(self):
+        global a_work
+        z_new = self.position.z + self.velocity.z*dt
+        if z_new < plate_z_m + self.radius:
+            v_n = dot(self.velocity, n_plate)
+            if v_n < 0:
+                v_n2 = -e_r * v_n
+                ΔK = 0.5*self.mass*(v_n**2 - v_n2**2)
+                a_work += ΔK
+                self.velocity += (v_n2 - v_n)*n_plate
+            self.position.z = plate_z_m + self.radius
+
+# ─────────── Initialize particles ───────────
+particles = []
+for kind, mass, charge, color in [('electron', m_e, -e, vector(0,0,1)),
+                                  ('ion',      m_ion, +e, vector(1,0,0))]:
+    radius = 0.15 if kind=='electron' else 0.2
+    for _ in range(N):
+        pos = vector(random.uniform(-8e-15,8e-15),
+                     random.uniform(-8e-15,8e-15),
+                     random.uniform(0,4e-15))
+        sph = sphere(pos=pos*position_scale, radius=radius,
+                     color=color, make_trail=True, trail_color=color)
+        particles.append(Particle(sph, pos, vector(0,0,-impact_speed), mass, charge, kind))
+
+# ─────────── Info display ───────────
+info = wtext(text='')
+
+# ─────────── Main Loop ───────────
+step = 0
+while step < total_steps:
+    rate(100)
+    # compute forces
+    for p in particles: p.force = vector(0,0,0)
+    for i in range(len(particles)):
+        for j in range(i+1, len(particles)):
+            p1, p2 = particles[i], particles[j]
+            r = p2.position - p1.position
+            d = mag(r) if mag(r)>1e-20 else 1e-20
+            r_hat = r/d
+            Fc = k_e*p1.charge*p2.charge/d**2 * r_hat
+            p1.force += Fc
+            p2.force -= Fc
+    # integrate & collide
+    for p in particles:
+        a = p.force/p.mass
+        p.velocity += a*dt
+        p.position += p.velocity*dt
+        p.collide_with_plate()
+        p.update_sphere_position()
+
+    info.text = f'Total collision work: {a_work:.2e} J (step {step}/{total_steps})\n'
+
+    # export
+    if step % output_frequency == 0:
+        fname = os.path.join(output_dir, f"particles_{step:06d}.csv")
+        with open(fname, 'w') as f:
+            f.write('x,y,z,vx,vy,vz,charge,kind\n')
+            for p in particles:
+                x,y,z = p.position.x, p.position.y, p.position.z
+                vx,vy,vz = p.velocity.x, p.velocity.y, p.velocity.z
+                f.write(f"{x:.6e},{y:.6e},{z:.6e},{vx:.6e},{vy:.6e},{vz:.6e},{p.charge:.6e},{p.kind}\n")
+        # append to summary
+        summary_file.write(f"{step},{a_work:.6e}\n")
+    step += 1
+
+# close summary
+summary_file.close()
+print('Simulation complete; wrote', total_steps//output_frequency + 1, 'CSVs and summary.csv')

@@ -1,0 +1,100 @@
+from vpython import *
+import random 
+
+scene = canvas(title='3D Plasma Simulation: 500 e⁻ + 500 ions + Al Plate w/ Collisions',
+               width=1200, height=800, center=vector(0,0,0), background=vector(0,0,0))
+
+k_e    = 8.9875517923e9     
+e      = 1.602176634e-19    
+m_e    = 9.1093837015e-31   
+m_ion  = 1.67262192e-27     
+
+dt             = 1e-22    
+position_scale = 1e16       # visualization scale
+impact_speed   = 8e8        
+N              = 500      
+
+electron_color = vector(0,0,1)
+ion_color      = vector(1,0,0)
+
+plate_thickness = 5e-15      
+plate_size_xy   = 5e-13      
+plate_z_m       = -10000.0/position_scale  
+plate = box(
+    pos=vector(0,0,plate_z_m - plate_thickness/2)*position_scale,
+    size=vector(plate_size_xy,plate_size_xy,plate_thickness)*position_scale,
+    color=vector(0.7,0.7,0.7), opacity=0.6
+)
+n_plate = vector(0,0,1)      
+
+e_r = 0.8                    # coefficient of restitution
+work_per_collision = 0.      
+
+# ─────────── Particle class ───────────
+class Particle:
+    def __init__(self, sph, pos, vel, m, q, kind):
+        self.sphere   = sph
+        self.position = pos
+        self.velocity = vel
+        self.mass     = m
+        self.charge   = q
+        self.kind     = kind
+        self.radius   = 2.8e-15 if kind=='electron' else 1e-15
+        self.force    = vector(0,0,0)
+    def update_sphere_position(self):
+        self.sphere.pos = self.position * position_scale
+    def collide_with_plate(self):
+        global work_per_collision
+        z_new = self.position.z + self.velocity.z*dt
+        if z_new < plate_z_m + self.radius:
+            v_n = dot(self.velocity, n_plate)
+            if v_n < 0:
+                v_n2 = -e_r * v_n
+                ΔK = 0.5*self.mass*(v_n**2 - v_n2**2)
+                work_per_collision += ΔK
+                self.velocity += (v_n2 - v_n)*n_plate
+            self.position.z = plate_z_m + self.radius
+particles = []
+
+for _ in range(N):
+    pos = vector(random.uniform(-8e-15,8e-15),
+                 random.uniform(-8e-15,8e-15),
+                 random.uniform(0,4e-15))
+    sph = sphere(pos=pos*position_scale, radius=0.15, color=electron_color,
+                 make_trail=True, trail_color=electron_color)
+    particles.append(Particle(sph, pos, vector(0,0,-impact_speed),
+                              m_e, -e, 'electron'))
+
+for _ in range(N):
+    pos = vector(random.uniform(-8e-15,8e-15),
+                 random.uniform(-8e-15,8e-15),
+                 random.uniform(0,4e-15))
+    sph = sphere(pos=pos*position_scale, radius=0.2, color=ion_color,
+                 make_trail=True, trail_color=ion_color)
+    particles.append(Particle(sph, pos, vector(0,0,-impact_speed),
+                              m_ion, +e, 'ion'))
+
+info = wtext(text=f'\nTotal collision work: {work_per_collision:.2e} J\n')
+
+while True:
+    rate(100)
+    for p in particles: p.force = vector(0,0,0)
+    M = len(particles)
+    for i in range(M):
+        for j in range(i+1,M):
+            p1,p2 = particles[i], particles[j]
+            r = p2.position - p1.position
+            d = mag(r) if mag(r)>1e-20 else 1e-20
+            r_hat = r/d
+            Fc = k_e*p1.charge*p2.charge/d**2 * r_hat
+            p1.force += Fc
+            p2.force -= Fc
+
+    for p in particles:
+        a = p.force/p.mass
+        p.velocity += a*dt
+        p.position += p.velocity*dt
+        p.collide_with_plate()
+        p.update_sphere_position()
+
+    info.text = f'\nTotal collision work: {work_per_collision:.2e} J\n'

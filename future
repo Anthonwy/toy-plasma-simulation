@@ -1,0 +1,198 @@
+from vpython import *
+import random, math, os
+from datetime import datetime
+
+# ─────────── Scene & Constants ───────────
+scene = canvas(title='3D Plasma + B-Field + Sheath + Collisions + Target Response',
+               width=1200, height=800, center=vector(0,0,0), background=vector(0,0,0))
+
+k_e, μ0    = 8.9875517923e9, 4*math.pi*1e-7     # electric & magnetic constants
+e, m_e, m_i = 1.602e-19, 9.11e-31, 1.67e-27     # charges & masses
+dt          = 1e-25                             # timestep
+scale       = 1e16                              # visualization
+N           = 500                               # particles per species
+B_ext       = vector(0,0,1e-3)                  # uniform external B‐field (T)
+λ_D         = 1e-5                              # Debye length (m), sheath scale
+
+# ─────────── Output dir (timestamped) & CSV headers ───────────
+base_outdir  = "pv_output"
+timestamp    = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+outdir       = os.path.join(base_outdir, timestamp)
+os.makedirs(outdir, exist_ok=True)
+
+# per‐particle dumps
+dump_every = 10
+step       = 0
+
+# metrics CSV
+metrics_fname = os.path.join(outdir, "metrics.csv")
+with open(metrics_fname, 'w') as mf:
+    mf.write("time_s,work_per_collision_J,stopping_power_J_per_m,"
+             "momentum_transfer_coeff,pressure_Pa,frac_reflected,frac_transmitted\n")
+
+# ─────────── Target plate ───────────
+plate_thk, plate_sz = 5e-15, 5e-13
+plate_z             = -20/scale
+plate_area          = plate_sz * plate_sz
+plate = box(pos=vector(0,0,plate_z-plate_thk/2)*scale,
+            size=vector(plate_sz,plate_sz,plate_thk)*scale,
+            color=vector(0.7,0.7,0.7), opacity=0.6)
+n_plate = vector(0,0,1)
+
+# ─────────── Global accumulators ───────────
+work_per_collision      = 0.0   # J
+momentum_imparted       = 0.0   # kg·m/s
+total_incident_ke       = 0.0   # J
+total_reflected_ke      = 0.0   # J
+total_incident_momentum = 0.0   # kg·m/s
+
+# ─────────── Particle class ───────────
+class Particle:
+    def __init__(self, sph, pos, vel, m, q, kind):
+        self.sph, self.pos, self.vel = sph, pos, vel
+        self.m, self.q, self.kind      = m, q, kind
+        self.force                     = vector(0,0,0)
+
+    def update_vis(self):
+        self.sph.pos = self.pos * scale
+
+    def apply_plate_collision(self):
+        global work_per_collision, momentum_imparted
+        global total_incident_ke, total_reflected_ke, total_incident_momentum
+
+        # normal component of velocity
+        v_n = dot(self.vel, n_plate)
+        if v_n < 0:  # only if moving into the plate
+            # accumulate incident KE & momentum
+            total_incident_ke       += 0.5 * self.m * v_n**2
+            total_incident_momentum += self.m * abs(v_n)
+
+            # restitution
+            v_n2 = -e_r * v_n
+            ΔK   = 0.5 * self.m * (v_n**2 - v_n2**2)
+            work_per_collision      += ΔK
+            total_reflected_ke      += 0.5 * self.m * v_n2**2
+
+            # impulse = change in normal momentum
+            Δp = self.m * (v_n2 - v_n)
+            momentum_imparted += abs(Δp)
+
+            # apply to velocity
+            self.vel += (v_n2 - v_n)*n_plate
+
+        # project to just outside plate
+        self.pos.z = plate_z + self.m*0  # radius neglected
+
+    def apply_material_response(self):
+        # stub: e.g. sputter yields, SEE, surface heating...
+        return
+
+# coefficient of restitution
+e_r = 0.8
+
+# ─────────── Initialize particles ───────────
+particles = []
+for kind, mass, charge, color in [
+    ('electron', m_e, -e, vector(0,0,1)),
+    ('ion',      m_i, +e, vector(1,0,0))
+]:
+    for _ in range(N):
+        pos = vector(random.uniform(-8e-15,8e-15),
+                     random.uniform(-8e-15,8e-15),
+                     random.uniform(0,4e-15))
+        sph = sphere(pos=pos*scale,
+                     radius=(0.15 if kind=='electron' else 0.2),
+                     color=color, make_trail=True, trail_color=color)
+        vel = vector(0,0,-1e7)
+        particles.append(Particle(sph, pos, vel, mass, charge, kind))
+
+# ─────────── Main loop ───────────
+while True:
+    rate(100)
+
+    # 1) Reset forces
+    for p in particles:
+        p.force = vector(0,0,0)
+
+    # 2) Coulomb + Debye‐screened interactions
+    M = len(particles)
+    for i in range(M):
+        for j in range(i+1, M):
+            p1, p2 = particles[i], particles[j]
+            r       = p2.pos - p1.pos
+            d       = mag(r) if mag(r)>1e-20 else 1e-20
+            screening = math.exp(-d/λ_D)
+            Fc      = (k_e * p1.q * p2.q / d**2 * screening) * (r/d)
+            p1.force += Fc
+            p2.force -= Fc
+
+    # 3) Lorentz force from uniform B_ext
+    for p in particles:
+        p.force += p.q * cross(p.vel, B_ext)
+
+    # 4) Crude Monte‐Carlo binary collisions
+    for p in particles:
+        if random.random() < 0.1:
+            partner = random.choice(particles)
+            v_cm    = (p.vel + partner.vel)/2
+            p.vel   = rotate(p.vel - v_cm,
+                             angle=random.uniform(-0.1,0.1),
+                             axis=vector(0,1,0)) + v_cm
+
+    # 5) Integrate, sheath & plate interactions
+    for p in particles:
+        a       = p.force / p.m
+        p.vel  += a * dt
+        p.pos  += p.vel * dt
+
+        # sheath reflection
+        sheath_z = plate_z + 5*λ_D
+        if p.kind=='electron' and p.pos.z < sheath_z:
+            p.vel.z = abs(p.vel.z)
+
+        # plate collision
+        if p.pos.z < plate_z + 2e-15:
+            p.apply_plate_collision()
+            p.apply_material_response()
+
+        p.update_vis()
+
+    # 6) Dump CSVs every N steps
+    if step % dump_every == 0:
+        # per-particle
+        fname = os.path.join(outdir, f"particles_{step:06d}.csv")
+        with open(fname,'w') as f:
+            f.write("x,y,z,vx,vy,vz,charge,kind\n")
+            for p in particles:
+                x,y,z    = p.pos.x, p.pos.y, p.pos.z
+                vx,vy,vz = p.vel.x, p.vel.y, p.vel.z
+                f.write(f"{x:.6e},{y:.6e},{z:.6e},"
+                        f"{vx:.6e},{vy:.6e},{vz:.6e},"
+                        f"{p.q:.6e},{p.kind}\n")
+
+        # metrics summary
+        t = step * dt
+        stopping_power            = work_per_collision / plate_thk
+        incident_mom_flux         = total_incident_momentum
+        momentum_transfer_coeff   = (momentum_imparted / incident_mom_flux
+                                     if incident_mom_flux>0 else 0)
+        pressure                  = (momentum_imparted /
+                                     (plate_area * (dump_every*dt)))
+        frac_reflected            = (total_reflected_ke / total_incident_ke
+                                     if total_incident_ke>0 else 0)
+        frac_transmitted          = 1.0 - frac_reflected
+
+        with open(metrics_fname, 'a') as mf:
+            mf.write(f"{t:.6e},{work_per_collision:.6e},"
+                     f"{stopping_power:.6e},{momentum_transfer_coeff:.6e},"
+                     f"{pressure:.6e},{frac_reflected:.6e},"
+                     f"{frac_transmitted:.6e}\n")
+
+        # reset interval sums (if you want per‐interval rather than cumulative)
+        # work_per_collision = 0
+        # momentum_imparted  = 0
+        # total_incident_ke  = 0
+        # total_reflected_ke = 0
+        # total_incident_momentum = 0
+
+    step += 1
